@@ -444,56 +444,147 @@ window.Neurova = window.Neurova || {};
 
   // ---------------- EMG live view (dev tool — not a roadmap test, no verdict/logging) ----------------
   //
-  // Two exponential moving averages, one fast and one slow, are a simple and common way to
-  // separate "what's happening right now" from "what's normal" without a separate explicit
-  // calibration step. The slow average drifts along with the resting baseline; the fast
-  // average tracks real muscle activity almost immediately. When fast pulls far enough above
-  // slow, that's movement — mirroring the same idea as GOOD_CONTACT_MULTIPLE on the Arduino
-  // side (judge against a personal baseline, not a fixed universal number).
+  // Detection is built on the person's own resting signal, not a fixed universal number —
+  // the same "judge against a personal baseline" idea the contact-check already uses.
+  // First, hold still for 10 seconds so the mean and natural variability (standard
+  // deviation) of *your* resting EMG can be measured. After that, the Y-axis is fixed to a
+  // range built from that baseline (not re-scaled every frame), and a "hump" is flagged
+  // when the live signal rises clearly further above the resting mean than its own normal
+  // wobble would explain — a real change of state, not just its usual small fluctuation.
   const EMG_PLOT_MAX_POINTS = 200;
-  const EMG_FAST_ALPHA = 0.35;
-  const EMG_SLOW_ALPHA = 0.02;
-  const EMG_MOVEMENT_MARGIN = 30; // raw ADC units fast must clear slow by, to count as movement
+  const EMG_BASELINE_DURATION_MS = 10000;
+  const EMG_STREAM_EXPECTED_INTERVAL_MS = 25;  // matches EMG_STREAM_INTERVAL_MS in the firmware
+  const EMG_LIVE_SMOOTHING_ALPHA = 0.3;      // light smoothing for the plotted line only
+  const EMG_HUMP_STDDEV_MULTIPLE = 4;        // how many baseline std-devs above the mean counts as a hump
+  const EMG_MIN_STDDEV_FLOOR = 5;            // guards against a suspiciously flat capture making detection oversensitive
 
   let emgStreamingActive = false;
-  let emgFastValue = null;
-  let emgSlowValue = null;
+  let emgPhase = 'idle';  // 'idle' | 'baseline' | 'live'
+  let emgSmoothedValue = null;
   let emgPlotPoints = [];
+  let emgBaselineSamples = [];
+  let emgBaselineMean = null;
+  let emgBaselineStdDev = null;
+  let emgYAxisMin = null;
+  let emgYAxisMax = null;
+  let emgBaselineCountdownTimer = null;
+  let emgBaselineFinishTimer = null;
+  let emgBaselineDeadline = null;
 
-  function resetEmgPlotState(){
-    emgFastValue = null;
-    emgSlowValue = null;
-    emgPlotPoints = [];
-    const canvas = document.getElementById('emgCanvas');
-    if(canvas){
-      const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
-    setResultIcon('emgMovementIcon', 'muted', false);
-    const textEl = document.getElementById('emgMovementText');
-    if(textEl){ textEl.textContent = 'Resting'; textEl.style.setProperty('--accent', 'var(--muted)'); }
-    const liveValueEl = document.getElementById('emgLiveValue');
-    if(liveValueEl){ liveValueEl.textContent = '—'; }
-  }
-
-  function feedEmgSample(raw){
-    emgFastValue = (emgFastValue === null) ? raw : (EMG_FAST_ALPHA * raw + (1 - EMG_FAST_ALPHA) * emgFastValue);
-    emgSlowValue = (emgSlowValue === null) ? raw : (EMG_SLOW_ALPHA * raw + (1 - EMG_SLOW_ALPHA) * emgSlowValue);
-
-    emgPlotPoints.push({ raw, smoothed: emgFastValue });
-    if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
-
-    const moving = (emgFastValue - emgSlowValue) > EMG_MOVEMENT_MARGIN;
+  function setEmgMovementUI(moving){
     setResultIcon('emgMovementIcon', moving ? 'good' : 'muted', moving);
     const textEl = document.getElementById('emgMovementText');
     if(textEl){
       textEl.textContent = moving ? 'Movement' : 'Resting';
       textEl.style.setProperty('--accent', moving ? 'var(--good)' : 'var(--muted)');
     }
+  }
+
+  function setEmgStatusText(text){
+    const el = document.getElementById('emgStatusText');
+    if(el) el.textContent = text;
+  }
+
+  function resetEmgPlotState(){
+    if(emgBaselineCountdownTimer){ clearInterval(emgBaselineCountdownTimer); emgBaselineCountdownTimer = null; }
+    if(emgBaselineFinishTimer){ clearTimeout(emgBaselineFinishTimer); emgBaselineFinishTimer = null; }
+    emgPhase = 'idle';
+    emgSmoothedValue = null;
+    emgPlotPoints = [];
+    emgBaselineSamples = [];
+    emgBaselineMean = null;
+    emgBaselineStdDev = null;
+    emgYAxisMin = null;
+    emgYAxisMax = null;
+    const canvas = document.getElementById('emgCanvas');
+    if(canvas){
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+    setEmgMovementUI(false);
+    setEmgStatusText('Stay relaxed, then capture a baseline to start.');
+    const liveValueEl = document.getElementById('emgLiveValue');
+    if(liveValueEl){ liveValueEl.textContent = '—'; }
+    const toggleBtn = document.getElementById('emgStreamToggleBtn');
+    if(toggleBtn) toggleBtn.textContent = 'Capture baseline (10s)';
+  }
+
+  function feedEmgSample(raw){
+    emgSmoothedValue = (emgSmoothedValue === null) ? raw : (EMG_LIVE_SMOOTHING_ALPHA * raw + (1 - EMG_LIVE_SMOOTHING_ALPHA) * emgSmoothedValue);
+
+    if(emgPhase === 'baseline'){
+      emgBaselineSamples.push(raw);
+      emgPlotPoints.push({ raw, smoothed: emgSmoothedValue });
+      if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
+      const liveValueEl = document.getElementById('emgLiveValue');
+      if(liveValueEl){ liveValueEl.textContent = raw; }
+      drawEmgCanvas();
+      return;
+    }
+
+    if(emgPhase !== 'live') return;
+
+    emgPlotPoints.push({ raw, smoothed: emgSmoothedValue });
+    if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
+
+    const moving = (emgSmoothedValue - emgBaselineMean) > (EMG_HUMP_STDDEV_MULTIPLE * emgBaselineStdDev);
+    setEmgMovementUI(moving);
     const liveValueEl = document.getElementById('emgLiveValue');
     if(liveValueEl){ liveValueEl.textContent = raw; }
 
     drawEmgCanvas();
+  }
+
+  // Runs the 10-second hold-still window, then computes this person's resting mean and
+  // standard deviation and switches into live detection against that personal baseline.
+  function startBaselineCapture(){
+    emgPhase = 'baseline';
+    emgBaselineSamples = [];
+    emgPlotPoints = [];
+    emgSmoothedValue = null;
+    emgBaselineDeadline = Date.now() + EMG_BASELINE_DURATION_MS;
+    setEmgStatusText('Stay relaxed — capturing baseline… ' + Math.ceil(EMG_BASELINE_DURATION_MS / 1000) + 's');
+
+    emgBaselineCountdownTimer = setInterval(() => {
+      const remainingMs = emgBaselineDeadline - Date.now();
+      const remainingS = Math.max(0, Math.ceil(remainingMs / 1000));
+      setEmgStatusText('Stay relaxed — capturing baseline… ' + remainingS + 's');
+    }, 250);
+
+    emgBaselineFinishTimer = setTimeout(finishBaselineCapture, EMG_BASELINE_DURATION_MS);
+  }
+
+  function finishBaselineCapture(){
+    if(emgBaselineCountdownTimer){ clearInterval(emgBaselineCountdownTimer); emgBaselineCountdownTimer = null; }
+
+    // Guards against a stream that dropped out mid-capture — same spirit as
+    // CALIB_MIN_VALID_SAMPLES on the Arduino side: don't quietly build a baseline out of
+    // far fewer samples than a real 10-second capture should contain.
+    const expectedSamples = EMG_BASELINE_DURATION_MS / EMG_STREAM_EXPECTED_INTERVAL_MS;
+    if(emgBaselineSamples.length < expectedSamples * 0.5){
+      setEmgStatusText('Baseline capture interrupted — check the connection and try again.');
+      stopEmgStreamIfActive();
+      return;
+    }
+
+    const n = emgBaselineSamples.length;
+    const mean = emgBaselineSamples.reduce((sum, v) => sum + v, 0) / n;
+    const variance = emgBaselineSamples.reduce((sum, v) => sum + (v - mean) * (v - mean), 0) / n;
+    const stdDev = Math.max(Math.sqrt(variance), EMG_MIN_STDDEV_FLOOR);
+
+    emgBaselineMean = mean;
+    emgBaselineStdDev = stdDev;
+    // Fixed once, from the baseline — not re-scaled every frame — so a hump is visually
+    // obvious against a steady reference rather than the axis chasing the signal around.
+    emgYAxisMin = Math.max(0, mean - (2 * stdDev) - 15);
+    emgYAxisMax = Math.min(1023, mean + (EMG_HUMP_STDDEV_MULTIPLE * stdDev) + (4 * stdDev));
+
+    emgPlotPoints = [];
+    emgSmoothedValue = null;
+    emgPhase = 'live';
+    setEmgStatusText('Baseline: ' + Math.round(mean) + ' ± ' + Math.round(stdDev) + ' — watching for movement.');
+    const toggleBtn = document.getElementById('emgStreamToggleBtn');
+    if(toggleBtn) toggleBtn.textContent = 'Stop';
   }
 
   function drawEmgCanvas(){
@@ -503,16 +594,31 @@ window.Neurova = window.Neurova || {};
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    // Auto-scale to whatever's actually in the current window, so movement is visible
-    // regardless of where the resting baseline happens to sit for this person/session.
-    let minV = Infinity, maxV = -Infinity;
-    emgPlotPoints.forEach(p => {
-      minV = Math.min(minV, p.raw, p.smoothed);
-      maxV = Math.max(maxV, p.raw, p.smoothed);
-    });
-    if(maxV - minV < 10){ maxV += 5; minV -= 5; } // avoid a divide-by-near-zero on a dead-flat signal
+    let minV, maxV;
+    if(emgPhase === 'live' && emgYAxisMin !== null && emgYAxisMax !== null){
+      minV = emgYAxisMin;
+      maxV = emgYAxisMax;
+    } else {
+      // Still finding the baseline — auto-scale just enough to show the capture is alive;
+      // the real fixed range only exists once the baseline itself exists.
+      minV = Infinity; maxV = -Infinity;
+      emgPlotPoints.forEach(p => { minV = Math.min(minV, p.raw); maxV = Math.max(maxV, p.raw); });
+      if(maxV - minV < 10){ maxV += 5; minV -= 5; }
+    }
     const toY = v => h - ((v - minV) / (maxV - minV)) * h;
     const toX = i => (i / (EMG_PLOT_MAX_POINTS - 1)) * w;
+
+    if(emgPhase === 'live' && emgBaselineMean !== null){
+      ctx.beginPath();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 1;
+      const baselineY = toY(emgBaselineMean);
+      ctx.moveTo(0, baselineY);
+      ctx.lineTo(w, baselineY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
 
     const drawLine = (key, color, lineWidth) => {
       ctx.beginPath();
@@ -621,11 +727,15 @@ window.Neurova = window.Neurova || {};
 
   // EMG live view is a dev tool, not a roadmap test — always enabled, no calibration gate.
   function stopEmgStreamIfActive(){
-    if(!emgStreamingActive) return;
+    if(emgBaselineCountdownTimer){ clearInterval(emgBaselineCountdownTimer); emgBaselineCountdownTimer = null; }
+    if(emgBaselineFinishTimer){ clearTimeout(emgBaselineFinishTimer); emgBaselineFinishTimer = null; }
+    if(!emgStreamingActive){ emgPhase = 'idle'; return; }
     sendCommand('EMG_STREAM_STOP');
     emgStreamingActive = false;
+    emgPhase = 'idle';
     const toggleBtn = document.getElementById('emgStreamToggleBtn');
-    if(toggleBtn) toggleBtn.textContent = 'Start';
+    if(toggleBtn) toggleBtn.textContent = 'Capture baseline (10s)';
+    setEmgStatusText('Stay relaxed, then capture a baseline to start.');
   }
 
   document.getElementById('goEmgDebugBtn').addEventListener('click', () => {
@@ -637,13 +747,14 @@ window.Neurova = window.Neurova || {};
     goTo('MENU');
   });
   document.getElementById('emgStreamToggleBtn').addEventListener('click', async () => {
-    const toggleBtn = document.getElementById('emgStreamToggleBtn');
-    if(!emgStreamingActive){
+    if(emgPhase === 'idle'){
       resetEmgPlotState();
       const sent = await sendCommand('EMG_STREAM_START');
       if(!sent) return;
       emgStreamingActive = true;
-      toggleBtn.textContent = 'Stop';
+      const toggleBtn = document.getElementById('emgStreamToggleBtn');
+      if(toggleBtn) toggleBtn.textContent = 'Cancel';
+      startBaselineCapture();
     } else {
       stopEmgStreamIfActive();
     }
@@ -772,12 +883,19 @@ window.Neurova = window.Neurova || {};
   // the signed-in account changes (login, logout, or switching accounts), so a previous
   // account's baseline can never linger on screen or leave the contact test unlocked
   // for someone it doesn't belong to.
-  window.Neurova.resetCalibration = function(){
+  //
+  // preserveMeasuredBaseline is true for exactly one transition: no account was signed in,
+  // and a specific account is now appearing for the first time in this sitting (calibrate
+  // as a guest, then sign up). That's the only case where "this is a physical fact about
+  // whoever's wearing the glove right now" safely holds. Any other transition — a
+  // different account taking over, or simply signing out — can't safely assume that, so
+  // it's treated exactly like a restored baseline and cleared. Without this distinction,
+  // a measured baseline from one account could otherwise silently carry into the next
+  // account that logs in on the same physical board.
+  window.Neurova.resetCalibration = function(preserveMeasuredBaseline){
     savedAccountCalib = null;
-    // A baseline the board measured on skin is a physical fact about whoever is wearing
-    // the glove, so it survives an account change. One that was restored from an account
-    // belongs to that account, and must not carry over to the next person who logs in.
-    if(boardBaseline && boardBaseline.source === 'restored'){
+    const shouldClearMeasured = !preserveMeasuredBaseline;
+    if(boardBaseline && (boardBaseline.source === 'restored' || (boardBaseline.source === 'measured' && shouldClearMeasured))){
       boardBaseline = null;
       setTestUnlocked(false);
     }
@@ -1521,14 +1639,19 @@ window.Neurova = window.Neurova || {};
 
   if(firebaseReady && auth){
     auth.onAuthStateChanged(user => {
+      const previousUid = currentUser ? currentUser.uid : null;
       currentUser = user;
+      const newUid = user ? user.uid : null;
       if(!user){ authMode = 'login'; confirmingDelete = false; deleteError = ''; needsReauth = false; cachedProfile = null; calibLoadFailed = false; }
       authError = '';
       authBusy = false;
       renderAccountPanel();
       renderDataAuthBanner();
       if(window.Neurova.onAccountChange) window.Neurova.onAccountChange();
-      if(window.Neurova.resetCalibration) window.Neurova.resetCalibration();
+      // See resetCalibration's comment: only the "was a guest, now signing into a
+      // brand-new account" transition gets to keep a just-measured baseline.
+      const guestToNewAccount = (previousUid === null) && (newUid !== null);
+      if(window.Neurova.resetCalibration) window.Neurova.resetCalibration(guestToNewAccount);
       if(user) loadSavedCalibrationForCurrentUser();
     });
   } else {
@@ -1541,4 +1664,3 @@ window.Neurova = window.Neurova || {};
 function setNeurovaVersion(v){
   try{ localStorage.setItem('neurovaSiteVersion', v); }catch(e){ /* storage unavailable, link still navigates */ }
 }
-//Blah
