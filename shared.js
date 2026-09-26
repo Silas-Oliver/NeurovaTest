@@ -446,11 +446,16 @@ window.Neurova = window.Neurova || {};
   //
   // Detection is built on the person's own resting signal, not a fixed universal number —
   // the same "judge against a personal baseline" idea the contact-check already uses.
-  // First, hold still for 10 seconds so the mean and natural variability (standard
-  // deviation) of *your* resting EMG can be measured. After that, the Y-axis is fixed to a
-  // range built from that baseline (not re-scaled every frame), and a "hump" is flagged
-  // when the live signal rises clearly further above the resting mean than its own normal
-  // wobble would explain — a real change of state, not just its usual small fluctuation.
+  // First, hold still for 10 seconds so the natural variability of *your* resting EMG can
+  // be measured. After that the Y-axis is fixed to a range built from that baseline (not
+  // re-scaled every frame).
+  //
+  // What counts as movement is the *onset* — how fast the signal is climbing — not how
+  // high it gets. Judging by height alone misses the thing we actually care about: a flex
+  // that rises sharply but peaks just under some absolute line reads as nothing, while a
+  // slow drift up (sweat, an electrode settling, the arm resting differently) eventually
+  // crosses it and reads as movement. Rate of change separates those cleanly — a real
+  // contraction has a steep leading edge, drift does not, however far it eventually goes.
   const EMG_PLOT_MAX_POINTS = 200;
   const EMG_BASELINE_DURATION_MS = 10000;
   const EMG_STREAM_EXPECTED_INTERVAL_MS = 25;  // matches EMG_STREAM_INTERVAL_MS in the firmware
@@ -458,8 +463,16 @@ window.Neurova = window.Neurova || {};
   const EMG_DETECT_ALPHA = 0.6;              // faster, less-lagged signal used for the movement decision itself —
                                               // separate from the plot line, so a quick flex's peak doesn't get
                                               // blunted by the smoothing that makes the plot look nice
-  const EMG_HUMP_STDDEV_MULTIPLE = 3;        // how many baseline std-devs above the mean counts as a hump
+  const EMG_HUMP_STDDEV_MULTIPLE = 3;        // still used to size the fixed Y-axis, not to decide movement
   const EMG_MIN_STDDEV_FLOOR = 5;            // guards against a suspiciously flat capture making detection oversensitive
+  // Rise measured across a short window rather than between consecutive samples: a single
+  // sample-to-sample step is mostly noise, while ~150ms is about the timescale a real
+  // contraction's leading edge takes to develop.
+  const EMG_SLOPE_WINDOW_SAMPLES = 6;        // ~150ms at 25ms/sample
+  const EMG_SLOPE_STDDEV_MULTIPLE = 4;       // how many resting-slope std-devs counts as a sudden change
+  const EMG_MIN_SLOPE_FLOOR = 3;             // ADC counts across the window; stops a very quiet rest triggering on noise
+  const EMG_MOVEMENT_HOLD_MS = 600;          // an onset is an instant — keep the readout lit long enough to read
+  const EMG_REFRACTORY_MS = 400;             // one contraction is one event, not a burst of them
 
   let emgStreamingActive = false;
   let emgPhase = 'idle';  // 'idle' | 'baseline' | 'live'
@@ -469,6 +482,11 @@ window.Neurova = window.Neurova || {};
   let emgBaselineSamples = [];
   let emgBaselineMean = null;
   let emgBaselineStdDev = null;
+  let emgDetectHistory = [];     // recent detect-smoothed values, for measuring rise across a window
+  let emgBaselineSlopes = [];    // how much the signal drifts at rest — what a real onset has to beat
+  let emgSlopeThreshold = null;
+  let emgLastOnsetAt = 0;
+  let emgMovementUntil = 0;
   let emgYAxisMin = null;
   let emgYAxisMax = null;
   let emgBaselineCountdownTimer = null;
@@ -499,8 +517,11 @@ window.Neurova = window.Neurova || {};
     emgBaselineSamples = [];
     emgBaselineMean = null;
     emgBaselineStdDev = null;
-    emgYAxisMin = null;
-    emgYAxisMax = null;
+    emgDetectHistory = [];
+    emgBaselineSlopes = [];
+    emgSlopeThreshold = null;
+    emgLastOnsetAt = 0;
+    emgMovementUntil = 0;
     const canvas = document.getElementById('emgCanvas');
     if(canvas){
       const ctx = canvas.getContext('2d');
@@ -514,15 +535,30 @@ window.Neurova = window.Neurova || {};
     if(toggleBtn) toggleBtn.textContent = 'Capture baseline (10s)';
   }
 
+  // How much the signal has climbed across the last EMG_SLOPE_WINDOW_SAMPLES. Positive
+  // means rising; returns null until there's enough history to measure a full window.
+  function currentEmgRise(){
+    if(emgDetectHistory.length <= EMG_SLOPE_WINDOW_SAMPLES) return null;
+    return emgDetectValue - emgDetectHistory[0];
+  }
+
   function feedEmgSample(raw){
     emgSmoothedValue = (emgSmoothedValue === null) ? raw : (EMG_LIVE_SMOOTHING_ALPHA * raw + (1 - EMG_LIVE_SMOOTHING_ALPHA) * emgSmoothedValue);
     emgDetectValue = (emgDetectValue === null) ? raw : (EMG_DETECT_ALPHA * raw + (1 - EMG_DETECT_ALPHA) * emgDetectValue);
 
+    emgDetectHistory.push(emgDetectValue);
+    if(emgDetectHistory.length > EMG_SLOPE_WINDOW_SAMPLES + 1){ emgDetectHistory.shift(); }
+    const rise = currentEmgRise();
+
+    const liveValueEl = document.getElementById('emgLiveValue');
+
     if(emgPhase === 'baseline'){
       emgBaselineSamples.push(raw);
-      emgPlotPoints.push({ raw, smoothed: emgSmoothedValue });
+      // Resting rise is the yardstick: whatever the signal does on its own while you hold
+      // still is what a deliberate movement has to clearly out-climb.
+      if(rise !== null){ emgBaselineSlopes.push(rise); }
+      emgPlotPoints.push({ raw, smoothed: emgSmoothedValue, onset: false });
       if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
-      const liveValueEl = document.getElementById('emgLiveValue');
       if(liveValueEl){ liveValueEl.textContent = raw; }
       drawEmgCanvas();
       return;
@@ -530,12 +566,20 @@ window.Neurova = window.Neurova || {};
 
     if(emgPhase !== 'live') return;
 
-    emgPlotPoints.push({ raw, smoothed: emgSmoothedValue });
+    const now = Date.now();
+    let onset = false;
+    if(rise !== null && emgSlopeThreshold !== null
+       && rise > emgSlopeThreshold
+       && (now - emgLastOnsetAt) > EMG_REFRACTORY_MS){
+      onset = true;
+      emgLastOnsetAt = now;
+      emgMovementUntil = now + EMG_MOVEMENT_HOLD_MS;
+    }
+
+    emgPlotPoints.push({ raw, smoothed: emgSmoothedValue, onset });
     if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
 
-    const moving = (emgDetectValue - emgBaselineMean) > (EMG_HUMP_STDDEV_MULTIPLE * emgBaselineStdDev);
-    setEmgMovementUI(moving);
-    const liveValueEl = document.getElementById('emgLiveValue');
+    setEmgMovementUI(now < emgMovementUntil);
     if(liveValueEl){ liveValueEl.textContent = raw; }
 
     drawEmgCanvas();
@@ -546,6 +590,9 @@ window.Neurova = window.Neurova || {};
   function startBaselineCapture(){
     emgPhase = 'baseline';
     emgBaselineSamples = [];
+    emgBaselineSlopes = [];
+    emgDetectHistory = [];
+    emgSlopeThreshold = null;
     emgPlotPoints = [];
     emgSmoothedValue = null;
     emgDetectValue = null;
@@ -581,6 +628,18 @@ window.Neurova = window.Neurova || {};
 
     emgBaselineMean = mean;
     emgBaselineStdDev = stdDev;
+
+    // The movement test itself: how steeply the signal climbs, measured against how
+    // steeply it drifts while you're holding still. The floor keeps an unusually quiet
+    // capture from setting a threshold so low that ordinary noise trips it.
+    let slopeThreshold = EMG_MIN_SLOPE_FLOOR;
+    if(emgBaselineSlopes.length > 0){
+      const sn = emgBaselineSlopes.length;
+      const slopeMean = emgBaselineSlopes.reduce((sum, v) => sum + v, 0) / sn;
+      const slopeVar = emgBaselineSlopes.reduce((sum, v) => sum + (v - slopeMean) * (v - slopeMean), 0) / sn;
+      slopeThreshold = Math.max(slopeMean + (EMG_SLOPE_STDDEV_MULTIPLE * Math.sqrt(slopeVar)), EMG_MIN_SLOPE_FLOOR);
+    }
+    emgSlopeThreshold = slopeThreshold;
     // Fixed once, from the baseline — not re-scaled every frame — so a hump is visually
     // obvious against a steady reference rather than the axis chasing the signal around.
     emgYAxisMin = Math.max(0, mean - (2 * stdDev) - 15);
@@ -589,8 +648,13 @@ window.Neurova = window.Neurova || {};
     emgPlotPoints = [];
     emgSmoothedValue = null;
     emgDetectValue = null;
+    emgDetectHistory = [];
+    emgLastOnsetAt = 0;
+    emgMovementUntil = 0;
     emgPhase = 'live';
-    setEmgStatusText('Baseline: ' + Math.round(mean) + ' ± ' + Math.round(stdDev) + ' — watching for movement.');
+    setEmgStatusText('Baseline: ' + Math.round(mean) + ' ± ' + Math.round(stdDev) +
+      ' — watching for a rise of ' + (Math.round(slopeThreshold * 10) / 10) + '+ per ' +
+      Math.round(EMG_SLOPE_WINDOW_SAMPLES * EMG_STREAM_EXPECTED_INTERVAL_MS) + 'ms.');
     const toggleBtn = document.getElementById('emgStreamToggleBtn');
     if(toggleBtn) toggleBtn.textContent = 'Stop';
   }
@@ -643,6 +707,21 @@ window.Neurova = window.Neurova || {};
     const accentColor = getComputedStyle(document.documentElement).getPropertyValue('--good').trim() || '#4ade80';
     drawLine('raw', 'rgba(255,255,255,0.25)', 1);  // faint raw signal
     drawLine('smoothed', accentColor, 2);           // smoothed line on top
+
+    // A marker at each detected onset — the point of the whole exercise is seeing exactly
+    // where the signal was judged to have taken off, so it can be checked against what the
+    // hand was actually doing at that instant.
+    const warnColor = getComputedStyle(document.documentElement).getPropertyValue('--warn').trim() || '#d98a3d';
+    emgPlotPoints.forEach((p, i) => {
+      if(!p.onset) return;
+      const x = toX(i);
+      ctx.beginPath();
+      ctx.strokeStyle = warnColor;
+      ctx.lineWidth = 1.5;
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    });
   }
 
   function setVerdict(text, kind, summary){
