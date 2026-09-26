@@ -473,6 +473,13 @@ window.Neurova = window.Neurova || {};
   const EMG_MIN_SLOPE_FLOOR = 3;             // ADC counts across the window; stops a very quiet rest triggering on noise
   const EMG_MOVEMENT_HOLD_MS = 600;          // an onset is an instant — keep the readout lit long enough to read
   const EMG_REFRACTORY_MS = 400;             // one contraction is one event, not a burst of them
+  // How tall the fixed Y-axis is. Scaling it purely to the baseline's own std-dev zooms
+  // right in on a quiet signal, so ordinary resting noise fills the plot and everything
+  // looks frantic. The floor keeps the view wide enough that rest reads as a flat band and
+  // a real contraction is the thing that stands out.
+  const EMG_AXIS_MIN_SPAN = 100;             // ADC counts — minimum height of the plotted range
+  const EMG_AXIS_STDDEV_SPAN = 16;           // for a noisier baseline, size the range from its std-dev instead
+  const EMG_AXIS_HEADROOM = 0.75;            // share of the range that sits above the baseline, since flexes only go up
 
   let emgStreamingActive = false;
   let emgPhase = 'idle';  // 'idle' | 'baseline' | 'live'
@@ -642,8 +649,9 @@ window.Neurova = window.Neurova || {};
     emgSlopeThreshold = slopeThreshold;
     // Fixed once, from the baseline — not re-scaled every frame — so a hump is visually
     // obvious against a steady reference rather than the axis chasing the signal around.
-    emgYAxisMin = Math.max(0, mean - (2 * stdDev) - 15);
-    emgYAxisMax = Math.min(1023, mean + (EMG_HUMP_STDDEV_MULTIPLE * stdDev) + (4 * stdDev));
+    const axisSpan = Math.max(EMG_AXIS_MIN_SPAN, EMG_AXIS_STDDEV_SPAN * stdDev);
+    emgYAxisMin = Math.max(0, mean - (axisSpan * (1 - EMG_AXIS_HEADROOM)));
+    emgYAxisMax = Math.min(1023, mean + (axisSpan * EMG_AXIS_HEADROOM));
 
     emgPlotPoints = [];
     emgSmoothedValue = null;
