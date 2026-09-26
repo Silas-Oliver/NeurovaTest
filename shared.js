@@ -455,12 +455,16 @@ window.Neurova = window.Neurova || {};
   const EMG_BASELINE_DURATION_MS = 10000;
   const EMG_STREAM_EXPECTED_INTERVAL_MS = 25;  // matches EMG_STREAM_INTERVAL_MS in the firmware
   const EMG_LIVE_SMOOTHING_ALPHA = 0.3;      // light smoothing for the plotted line only
-  const EMG_HUMP_STDDEV_MULTIPLE = 4;        // how many baseline std-devs above the mean counts as a hump
+  const EMG_DETECT_ALPHA = 0.6;              // faster, less-lagged signal used for the movement decision itself —
+                                              // separate from the plot line, so a quick flex's peak doesn't get
+                                              // blunted by the smoothing that makes the plot look nice
+  const EMG_HUMP_STDDEV_MULTIPLE = 3;        // how many baseline std-devs above the mean counts as a hump
   const EMG_MIN_STDDEV_FLOOR = 5;            // guards against a suspiciously flat capture making detection oversensitive
 
   let emgStreamingActive = false;
   let emgPhase = 'idle';  // 'idle' | 'baseline' | 'live'
   let emgSmoothedValue = null;
+  let emgDetectValue = null;
   let emgPlotPoints = [];
   let emgBaselineSamples = [];
   let emgBaselineMean = null;
@@ -490,6 +494,7 @@ window.Neurova = window.Neurova || {};
     if(emgBaselineFinishTimer){ clearTimeout(emgBaselineFinishTimer); emgBaselineFinishTimer = null; }
     emgPhase = 'idle';
     emgSmoothedValue = null;
+    emgDetectValue = null;
     emgPlotPoints = [];
     emgBaselineSamples = [];
     emgBaselineMean = null;
@@ -511,6 +516,7 @@ window.Neurova = window.Neurova || {};
 
   function feedEmgSample(raw){
     emgSmoothedValue = (emgSmoothedValue === null) ? raw : (EMG_LIVE_SMOOTHING_ALPHA * raw + (1 - EMG_LIVE_SMOOTHING_ALPHA) * emgSmoothedValue);
+    emgDetectValue = (emgDetectValue === null) ? raw : (EMG_DETECT_ALPHA * raw + (1 - EMG_DETECT_ALPHA) * emgDetectValue);
 
     if(emgPhase === 'baseline'){
       emgBaselineSamples.push(raw);
@@ -527,7 +533,7 @@ window.Neurova = window.Neurova || {};
     emgPlotPoints.push({ raw, smoothed: emgSmoothedValue });
     if(emgPlotPoints.length > EMG_PLOT_MAX_POINTS){ emgPlotPoints.shift(); }
 
-    const moving = (emgSmoothedValue - emgBaselineMean) > (EMG_HUMP_STDDEV_MULTIPLE * emgBaselineStdDev);
+    const moving = (emgDetectValue - emgBaselineMean) > (EMG_HUMP_STDDEV_MULTIPLE * emgBaselineStdDev);
     setEmgMovementUI(moving);
     const liveValueEl = document.getElementById('emgLiveValue');
     if(liveValueEl){ liveValueEl.textContent = raw; }
@@ -542,6 +548,7 @@ window.Neurova = window.Neurova || {};
     emgBaselineSamples = [];
     emgPlotPoints = [];
     emgSmoothedValue = null;
+    emgDetectValue = null;
     emgBaselineDeadline = Date.now() + EMG_BASELINE_DURATION_MS;
     setEmgStatusText('Stay relaxed — capturing baseline… ' + Math.ceil(EMG_BASELINE_DURATION_MS / 1000) + 's');
 
@@ -581,6 +588,7 @@ window.Neurova = window.Neurova || {};
 
     emgPlotPoints = [];
     emgSmoothedValue = null;
+    emgDetectValue = null;
     emgPhase = 'live';
     setEmgStatusText('Baseline: ' + Math.round(mean) + ' ± ' + Math.round(stdDev) + ' — watching for movement.');
     const toggleBtn = document.getElementById('emgStreamToggleBtn');
